@@ -1,5 +1,5 @@
 const {
-  HEROES, BAN_PHASE_MS, BAN_SLOTS, PICK_PHASE_MS, PICK_TURN_MS, LOADING_MS, TICK_RATE
+  HEROES, BAN_SLOTS, BAN_TURN_MS, PICK_TURN_MS, LOADING_MS, TICK_RATE
 } = require('./constants');
 const { simulateTick, createInitialGameState, applyPlayerInput } = require('./simulation');
 
@@ -8,6 +8,14 @@ let matchCounter = 0;
 /**
  * One full match: ban -> pick -> loading -> live simulation -> ended.
  * Broadcasts state to every connected player (real or spectating), drives bots itself.
+ *
+ * Both the ban phase and pick phase are turn-based, one action per player at a
+ * time (matching the reference: a single active picker with their own visible
+ * countdown, not one shared clock for the whole phase). Each turn gets its own
+ * fresh phaseEndsAt broadcast to the whole match — this is what was missing
+ * before, which was why the client's countdown flickered and hit 0 mid-draft:
+ * the server was only ever sending the deadline for the ENTIRE phase, not the
+ * current turn, so the visible number had no relationship to whose turn it was.
  */
 class Match {
   constructor(teamA, teamB, registerMatch) {
@@ -18,11 +26,13 @@ class Match {
     this.registerMatch = registerMatch;
 
     this.phase = 'ban'; // ban -> pick -> loading -> live -> ended
-    this.bans = [];             // [{ team, hero }]
+    this.bans = [];             // [{ team, hero, by }]
     this.picks = {};            // playerId -> hero
+    this.banOrder = this._buildBanOrder();   // one ban-turn per slot, alternating teams, one player "on the clock" per team turn
+    this.banIndex = 0;
     this.pickOrder = this._buildDraftOrder();
     this.pickIndex = 0;
-    this.phaseEndsAt = Date.now() + BAN_PHASE_MS;
+    this.phaseEndsAt = Date.now() + BAN_TURN_MS;
     this.loadProgress = {};     // playerId -> 0..100
 
     this.gameState = null;
@@ -30,7 +40,17 @@ class Match {
     this.phaseTimer = null;
 
     this._broadcastAll();
-    this._scheduleBanPhaseEnd();
+    this._scheduleNextBanTurn();
+  }
+
+  // ---------- ban order: alternate blue/red, cycling through each team's 5 players ----------
+  _buildBanOrder() {
+    const order = [];
+    for (let i = 0; i < BAN_SLOTS / 2; i++) {
+      order.push({ team: 'blue', playerId: this.teamA[i % this.teamA.length].id });
+      order.push({ team: 'red', playerId: this.teamB[i % this.teamB.length].id });
+    }
+    return order;
   }
 
   // ---------- draft order: alternating blue/red, roughly MLBB-style ----------
@@ -46,48 +66,55 @@ class Match {
   _playerById(id) { return this.players.find(p => p.id === id); }
   _teamOf(id) { return this.teamA.some(p => p.id === id) ? 'blue' : 'red'; }
 
-  // ---------- BAN PHASE ----------
+  // ---------- BAN PHASE (turn-based) ----------
+  _scheduleNextBanTurn() {
+    if (this.banIndex >= this.banOrder.length) { this._startPickPhase(); return; }
+    const turn = this.banOrder[this.banIndex];
+    this.phaseEndsAt = Date.now() + BAN_TURN_MS; // fresh per-turn deadline, broadcast below
+    this._broadcastAll();
+    if (this.phaseTimer) clearTimeout(this.phaseTimer);
+    this.phaseTimer = setTimeout(() => {
+      if (this.phase === 'ban' && this.banIndex < this.banOrder.length && this.banOrder[this.banIndex] === turn) {
+        this._autoBan(turn);
+      }
+    }, BAN_TURN_MS);
+  }
+
   handleBan(playerId, hero) {
     if (this.phase !== 'ban') return;
-    if (this.bans.length >= BAN_SLOTS) return;
+    const turn = this.banOrder[this.banIndex];
+    if (!turn || turn.playerId !== playerId) return; // not your turn
     if (this.bans.some(b => b.hero === hero)) return;
-    this.bans.push({ team: this._teamOf(playerId), hero, by: playerId });
-    this._broadcastAll();
-    if (this.bans.length >= BAN_SLOTS) this._startPickPhase();
+    this.bans.push({ team: turn.team, hero, by: playerId });
+    this.banIndex++;
+    this._scheduleNextBanTurn();
   }
 
-  _scheduleBanPhaseEnd() {
-    this.phaseTimer = setTimeout(() => {
-      // auto-fill remaining bans randomly so the draft never stalls
-      while (this.bans.length < BAN_SLOTS) {
-        const available = HEROES.filter(h => !this.bans.some(b => b.hero === h));
-        const hero = available[Math.floor(Math.random() * available.length)];
-        const team = this.bans.length % 2 === 0 ? 'blue' : 'red';
-        this.bans.push({ team, hero, by: null });
-      }
-      this._startPickPhase();
-    }, BAN_PHASE_MS);
+  _autoBan(turn) {
+    const taken = new Set(this.bans.map(b => b.hero));
+    const available = HEROES.filter(h => !taken.has(h));
+    const hero = available[Math.floor(Math.random() * available.length)] || HEROES[0];
+    this.bans.push({ team: turn.team, hero, by: null });
+    this.banIndex++;
+    this._scheduleNextBanTurn();
   }
 
-  // ---------- PICK PHASE ----------
+  // ---------- PICK PHASE (turn-based) ----------
   _startPickPhase() {
     if (this.phaseTimer) clearTimeout(this.phaseTimer);
     this.phase = 'pick';
     this.pickIndex = 0;
-    this.phaseEndsAt = Date.now() + PICK_PHASE_MS;
-    this._broadcastAll();
     this._scheduleNextPickTurn();
   }
 
   _scheduleNextPickTurn() {
     if (this.pickIndex >= this.pickOrder.length) { this._startLoading(); return; }
     const currentPlayerId = this.pickOrder[this.pickIndex];
-    this.currentPickDeadline = Date.now() + PICK_TURN_MS;
+    this.phaseEndsAt = Date.now() + PICK_TURN_MS; // fresh per-turn deadline, broadcast below
     this._broadcastAll();
     if (this.phaseTimer) clearTimeout(this.phaseTimer);
     this.phaseTimer = setTimeout(() => {
-      const p = this._playerById(currentPlayerId);
-      if (p && !this.picks[currentPlayerId]) {
+      if (this.phase === 'pick' && this.pickOrder[this.pickIndex] === currentPlayerId && !this.picks[currentPlayerId]) {
         this._autoPick(currentPlayerId);
       }
     }, PICK_TURN_MS);
@@ -100,7 +127,6 @@ class Match {
     if (Object.values(this.picks).includes(hero)) return;
     this.picks[playerId] = hero;
     this.pickIndex++;
-    this._broadcastAll();
     this._scheduleNextPickTurn();
   }
 
@@ -110,7 +136,6 @@ class Match {
     const hero = available[Math.floor(Math.random() * available.length)] || HEROES[0];
     this.picks[playerId] = hero;
     this.pickIndex++;
-    this._broadcastAll();
     this._scheduleNextPickTurn();
   }
 
@@ -165,6 +190,7 @@ class Match {
   }
 
   _broadcastAll() {
+    const activeBanTurn = (this.phase === 'ban' && this.banIndex < this.banOrder.length) ? this.banOrder[this.banIndex] : null;
     const payload = {
       type: 'match_state',
       matchId: this.id,
@@ -172,6 +198,9 @@ class Match {
       teamA: this.teamA.map(p => ({ id: p.id, name: p.name, isBot: !!p.isBot })),
       teamB: this.teamB.map(p => ({ id: p.id, name: p.name, isBot: !!p.isBot })),
       bans: this.bans,
+      banOrder: this.banOrder,
+      banIndex: this.banIndex,
+      activeBanPlayerId: activeBanTurn ? activeBanTurn.playerId : null,
       picks: this.picks,
       pickOrder: this.pickOrder,
       pickIndex: this.pickIndex,
